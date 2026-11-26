@@ -190,7 +190,7 @@ function rollEntry(m, e) {
   if (r.damage) {
     const dm = rollDamage(r.damage, crit);
     if (dm) {
-      const half = r.save ? ` <span class="dim">(half: ${Math.floor(dm.total / 2)})</span>` : '';
+      const half = r.save && /half/i.test(e.text) ? ` <span class="dim">(half: ${Math.floor(dm.total / 2)})</span>` : '';
       const label = `Damage${crit ? ' (crit, dice doubled)' : ''}`;
       if (dm.lines.length === 1) lines.push(`${label}: ${dm.lines[0].replace(/<b>(-?\d+)<\/b>/, '<span class="tot">$1</span>')}${half}`);
       else { dm.lines.forEach(l => lines.push(`${label}: ${l}`)); lines.push(`Total damage: <span class="tot">${dm.total}</span>${half}`); }
@@ -200,12 +200,19 @@ function rollEntry(m, e) {
   pushLog(m.name, e.name, lines);
 }
 function rollExtra(m, e, x) {
-  const comps = parseDamage(x.dice);
-  const dm = rollDamage(x.dice, false);
-  if (!dm) return toast('Could not read dice: ' + x.dice);
-  const lines = dm.lines.slice();
-  if (comps.length > 1) lines.push(`Total: <span class="tot">${dm.total}</span>`);
-  else lines[0] = lines[0].replace(/<b>(\d+)<\/b>/, '<span class="tot">$1</span>');
+  const lines = []; let crit = false;
+  if (x.attack != null && x.attack !== '') {
+    const a = rollD20(num(x.attack)); crit = a.nat === 20;
+    lines.push(`To hit: ${a.html}`);
+  }
+  if (x.dice) {
+    const comps = parseDamage(x.dice);
+    const dm = rollDamage(x.dice, crit);
+    if (!dm) return toast('Could not read dice: ' + x.dice);
+    const dl = dm.lines.map(l => (crit ? 'Damage (crit, dice doubled): ' : lines.length ? 'Damage: ' : '') + l);
+    if (comps.length > 1) { lines.push(...dl); lines.push(`Total: <span class="tot">${dm.total}</span>`); }
+    else lines.push(dl[0].replace(/<b>(-?\d+)<\/b>/, '<span class="tot">$1</span>'));
+  }
   pushLog(m.name, `${e.name} — ${x.label}`, lines);
 }
 function rollRecharge(m, e) {
@@ -393,7 +400,7 @@ function renderEntry(m, e, si, ei) {
   const hint = rollable ? `<span class="dice-hint"> 🎲</span>` : '';
   const xs = [];
   if (r.recharge) xs.push(`<button class="xchip" data-act="rollRecharge" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}">Recharge ${r.recharge}${r.recharge < 6 ? '–6' : ''}</button>`);
-  (r.extras || []).forEach((x, xi) => xs.push(`<button class="xchip" data-act="rollExtra" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}" data-xi="${xi}">🎲 ${esc(x.label)}: ${esc(x.dice)}</button>`));
+  (r.extras || []).forEach((x, xi) => xs.push(`<button class="xchip" data-act="rollExtra" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}" data-xi="${xi}">🎲 ${esc(x.label)}${x.attack != null && x.attack !== '' ? ` (${sgn(num(x.attack))} to hit)` : `: ${esc(x.dice)}`}</button>`));
   return `<div class="entry ${rollable ? 'rollable' : ''}" ${rollable ? `data-act="rollEntry" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}"` : ''}>
     ${firstHtml.replace(/<\/p>$/, hint + '</p>')}${paras.length ? fmt(paras.join('\n')) : ''}
     ${xs.length ? `<div class="xchips">${xs.join('')}</div>` : ''}
@@ -429,7 +436,7 @@ function renderEdit(m, opts) {
             <div><label>Target save</label>${inp(EP + 'roll.save', r.save || '', 'text', 'placeholder="DC 15 Dexterity"')}</div>
             <div><label>Recharge on</label>${inp(EP + 'roll.recharge', r.recharge ?? '', 'optnum', 'placeholder="5 = 5–6"')}</div>
           </div>
-          <label>Extra roll buttons (one per line — Label: dice)</label>${ta(EP + 'roll.extras', (r.extras || []).map(x => `${x.label}: ${x.dice}`).join('\n'), 'extras', 2)}
+          <label>Extra roll buttons (one per line — Label: dice, or Label: +to-hit | dice)</label>${ta(EP + 'roll.extras', (r.extras || []).map(x => `${x.label}: ${x.attack != null && x.attack !== '' ? sgn(num(x.attack)) + ' | ' : ''}${x.dice || ''}`).join('\n'), 'extras', 2)}
           <div class="ent-tools">
             <button class="btn small" data-act="entDetect" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}">Auto-fill rolls from text</button>
             <button class="btn small" data-act="entMove" data-mid="${esc(m.id)}" data-si="${si}" data-ei="${ei}" data-dir="-1">↑</button>
@@ -492,7 +499,10 @@ function onEditChange(el) {
     m.extras = v.split('\n').map(l => l.match(/^\s*([^:]+):\s*(.*)$/)).filter(Boolean).map(x => ({ label: x[1].trim(), text: x[2].trim() }));
   }
   else if (type === 'extras') {
-    const xs = v.split('\n').map(l => l.match(/^\s*([^:]+):\s*(.+)$/)).filter(Boolean).map(x => ({ label: x[1].trim(), dice: x[2].trim() }));
+    const xs = v.split('\n').map(l => l.match(/^\s*([^:]+):\s*(.+)$/)).filter(Boolean).map(x => {
+      const body = x[2].trim(), at = body.match(/^([+-]?\d+)\s*\|\s*(.*)$/);
+      return at ? { label: x[1].trim(), attack: num(at[1]), dice: at[2].trim() } : { label: x[1].trim(), dice: body };
+    });
     setPath(m, path, xs);
   }
   else setPath(m, path, v);
@@ -652,6 +662,8 @@ function viewHelp() {
     <h2>How it works</h2>
     <h3>Rolling (Play mode)</h3>
     <p>Tap an action with a 🎲 to roll it. Attacks roll d20 + to-hit and damage together (a natural 20 doubles the damage dice). Save-based abilities just roll damage and show the half-damage number. Tap an ability score for a check, “save” for a saving throw, a skill, or Initiative. The Dis / Normal / Adv switch applies to every d20 until you change it.</p>
+    <h3>Finding monsters</h3>
+    <p>On the Library tab (and in “+ Add monster”), type part of a name or type, and narrow by CR range. Sort A–Z or by CR.</p>
     <h3>Hit points</h3>
     <p>Tap HP and type <code>-5</code> (damage — temp HP absorbs it first), <code>+10</code> (healing, stops at max), or <code>45</code> (set exactly). Press Enter or tap away. Temp HP works the same way. Change Max HP in Edit mode.</p>
     <h3>Edit mode</h3>
