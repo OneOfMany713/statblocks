@@ -8,25 +8,111 @@ const ABILS = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
 const ABIL_NAMES = { str: 'Strength', dex: 'Dexterity', con: 'Constitution', int: 'Intelligence', wis: 'Wisdom', cha: 'Charisma' };
 
 /* ============================== state ============================== */
-let db = load();
-let ui = { tab: db.encounters.length ? 'encounter' : 'library', libSel: null, picker: false, logOpen: false, collapsed: {},
-  search: { q: '', min: '', max: '', sort: 'name' } };
+let db = blankDb();
+let ui = { tab: 'library', libSel: null, picker: false, logOpen: false, collapsed: {},
+  search: { q: '', min: '', max: '', sort: 'name' }, libLimit: 150 };
 let log = [];
 
 function blankDb() {
   return { version: 1, library: {}, encounters: [], activeEnc: null, settings: { mode: 'play', adv: 'normal' } };
 }
-function load() {
+
+/* ============================== storage (IndexedDB) ==============================
+   monsters store: one record per stat block (keyPath id)
+   meta store: 'encounters' (array), 'settings', 'activeEnc', 'migratedFrom'
+   The old localStorage copy (statblocks.v1) is read once to migrate, then left untouched as a fallback. */
+const IDB_NAME = 'statblocks', IDB_VER = 1;
+let idb = null, storageMode = 'indexeddb';
+const savedJson = new Map();   // monster id -> JSON last written, so only changed monsters are re-saved
+let libPending = false, saveTimer = null;
+
+const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const txDone = tx => new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = tx.onabort = () => rej(tx.error || new Error('transaction aborted')); });
+function idbOpen() {
+  return new Promise((res, rej) => {
+    if (!window.indexedDB) return rej(new Error('IndexedDB unavailable'));
+    const r = indexedDB.open(IDB_NAME, IDB_VER);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      if (!d.objectStoreNames.contains('monsters')) d.createObjectStore('monsters', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.onblocked = () => rej(new Error('blocked'));
+  });
+}
+function readLegacy() {
+  try { const raw = localStorage.getItem(STORE_KEY); if (raw) return Object.assign(blankDb(), JSON.parse(raw)); } catch (e) { console.warn(e); }
+  return null;
+}
+async function loadDb() {
   try {
-    const raw = localStorage.getItem(STORE_KEY);
-    if (raw) { const d = JSON.parse(raw); return Object.assign(blankDb(), d); }
-  } catch (e) { console.warn('load failed', e); }
-  return blankDb();
+    idb = await idbOpen();
+    const tx = idb.transaction(['monsters', 'meta']);
+    const ms = tx.objectStore('monsters'), meta = tx.objectStore('meta');
+    const [monsters, encounters, settings, activeEnc] = await Promise.all([
+      reqP(ms.getAll()), reqP(meta.get('encounters')), reqP(meta.get('settings')), reqP(meta.get('activeEnc'))]);
+    if (!monsters.length && encounters === undefined) {
+      const legacy = readLegacy();
+      if (legacy && (Object.keys(legacy.library || {}).length || (legacy.encounters || []).length)) {
+        db = legacy;
+        await persistNow(true);
+        await reqP(idb.transaction('meta', 'readwrite').objectStore('meta').put('localStorage ' + new Date().toISOString(), 'migratedFrom'));
+        toast(`Moved ${Object.keys(db.library).length} stat blocks to the new storage`);
+        return;
+      }
+    }
+    const d = blankDb();
+    monsters.forEach(m => { d.library[m.id] = m; savedJson.set(m.id, JSON.stringify(m)); });
+    if (Array.isArray(encounters)) d.encounters = encounters;
+    if (settings) Object.assign(d.settings, settings);
+    d.activeEnc = activeEnc ?? null;
+    db = d;
+  } catch (e) {
+    console.warn('IndexedDB failed, using localStorage', e);
+    storageMode = 'localStorage'; idb = null;
+    db = readLegacy() || blankDb();
+    toast('Using fallback storage (limited space)');
+  }
 }
-function save() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); }
-  catch (e) { toast('Could not save — storage full or blocked'); }
+/* save(true): the library may have changed. save(false): only encounters / settings changed. */
+function save(lib = true) {
+  if (lib) libPending = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, 120);
 }
+function flushSave() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer); saveTimer = null;
+  const lib = libPending; libPending = false;
+  persistNow(lib).catch(onSaveError);
+}
+function onSaveError(e) {
+  console.error(e);
+  toast(e && e.name === 'QuotaExceededError' ? 'Could not save — device storage is full' : 'Could not save — try again');
+}
+async function persistNow(lib) {
+  if (storageMode === 'localStorage') { localStorage.setItem(STORE_KEY, JSON.stringify(db)); return; }
+  const tx = idb.transaction(['monsters', 'meta'], 'readwrite');
+  const meta = tx.objectStore('meta');
+  meta.put(db.encounters, 'encounters'); meta.put(db.settings, 'settings'); meta.put(db.activeEnc, 'activeEnc');
+  const put = [], del = [];
+  if (lib) {
+    const ms = tx.objectStore('monsters');
+    for (const [id, m] of Object.entries(db.library)) {
+      const j = JSON.stringify(m);
+      if (savedJson.get(id) !== j) { ms.put(m); savedJson.set(id, j); put.push(id); }
+    }
+    for (const id of [...savedJson.keys()]) if (!db.library[id]) { ms.delete(id); savedJson.delete(id); del.push(id); }
+  }
+  try { await txDone(tx); }
+  catch (e) {  // nothing in a failed transaction was written: mark those monsters unsaved so the next save retries them
+    put.forEach(id => savedJson.delete(id)); del.forEach(id => savedJson.set(id, ''));
+    throw e;
+  }
+}
+
 function uid() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID().slice(0, 8);
   return Math.random().toString(36).slice(2, 10);
@@ -256,7 +342,7 @@ function activeEnc() {
 }
 function newEncounter(name) {
   const e = { id: uid(), name: name || `Encounter ${db.encounters.length + 1}`, groups: [] };
-  db.encounters.push(e); db.activeEnc = e.id; save(); return e;
+  db.encounters.push(e); db.activeEnc = e.id; save(false); return e;
 }
 function addToEncounter(monsterId, count = 1) {
   const enc = activeEnc() || newEncounter();
@@ -264,7 +350,7 @@ function addToEncounter(monsterId, count = 1) {
   let g = enc.groups.find(x => x.monsterId === monsterId);
   if (!g) { g = { id: uid(), monsterId, next: 1, instances: [] }; enc.groups.push(g); }
   for (let i = 0; i < count; i++) addInstance(g, m);
-  save();
+  save(false);
 }
 function addInstance(g, m) {
   if (g.instances.length >= MAX_INSTANCES) { toast(`Max ${MAX_INSTANCES} of one monster`); return false; }
@@ -619,19 +705,21 @@ function libListHtml() {
   if (!all) return '<div class="empty">No stat blocks yet. Import the .json files I made for you.</div>';
   const lib = searchResults(), sel = ui.libSel;
   if (!lib.length) return '<div class="empty">No monsters match.</div>';
-  return `<div class="muted count">${lib.length === all ? `${all} stat blocks` : `${lib.length} of ${all}`}</div><ul class="lib-list">${lib.map(m => `<li class="lib-item ${sel === m.id ? 'sel' : ''}">
+  const shown = lib.slice(0, ui.libLimit);
+  const more = lib.length > shown.length ? `<button class="btn" style="width:100%;margin-top:8px" data-act="libMore">Show ${Math.min(150, lib.length - shown.length)} more (${lib.length - shown.length} hidden — or narrow your search)</button>` : '';
+  return `<div class="muted count">${lib.length === all ? `${all} stat blocks` : `${lib.length} of ${all}`}</div><ul class="lib-list">${shown.map(m => `<li class="lib-item ${sel === m.id ? 'sel' : ''}">
       <div class="grow"><button class="nm" data-act="libView" data-mid="${esc(m.id)}">${esc(m.name)}</button>
         <div class="sub">CR ${esc(m.cr || '—')} · ${esc([m.size.split(' ')[0], m.type].filter(Boolean).join(' '))} · ${m.edition}</div></div>
       <button class="btn small primary" data-act="libAdd" data-mid="${esc(m.id)}">+ Encounter</button>
       <button class="btn small" data-act="libDup" data-mid="${esc(m.id)}">Duplicate</button>
       <button class="btn small" data-act="libExport" data-mid="${esc(m.id)}">Export</button>
       <button class="btn small danger" data-act="libDel" data-mid="${esc(m.id)}">Delete</button>
-    </li>`).join('')}</ul>`;
+    </li>`).join('')}</ul>${more}`;
 }
 function pickerListHtml() {
   if (!Object.keys(db.library).length) return '<div class="muted">Library is empty — import stat blocks on the Library tab.</div>';
   const lib = searchResults();
-  return lib.length ? lib.map(m => `<button class="btn" data-act="pickMonster" data-mid="${esc(m.id)}">${esc(m.name)} <span class="muted">CR ${esc(m.cr || '—')}</span></button>`).join('')
+  return lib.length ? lib.slice(0, 60).map(m => `<button class="btn" data-act="pickMonster" data-mid="${esc(m.id)}">${esc(m.name)} <span class="muted">CR ${esc(m.cr || '—')}</span></button>`).join('') + (lib.length > 60 ? `<div class="muted">${lib.length - 60} more — type to narrow the list</div>` : '')
     : '<div class="muted">No monsters match.</div>';
 }
 function refreshResults() {
@@ -670,7 +758,7 @@ function viewHelp() {
     <p>Every field becomes editable. Edits save automatically when you leave a field and apply everywhere that monster is used. To make a tuned variant, use Duplicate on the Library tab first.</p>
     <h3>Backups &amp; moving between devices</h3>
     <p>Your data lives only in this browser on this device. Library → <b>Export everything</b> saves a backup file; on another device, Library → <b>Import files…</b> and pick that file. Re-importing a monster with the same name replaces the old version.</p>
-    <p class="muted">Stored on this device: ${Object.keys(db.library).length} stat blocks, ${db.encounters.length} encounters.</p>
+    <p class="muted">Stored on this device: ${Object.keys(db.library).length} stat blocks, ${db.encounters.length} encounters (${storageMode === 'indexeddb' ? 'large-capacity storage' : 'fallback storage, about 5 MB'}).</p>
   </div>`;
 }
 function renderLog() {
@@ -693,7 +781,7 @@ function openHpEditor(btn) {
   let done = false;
   const finish = commit => {
     if (done) return; done = true;
-    if (commit && applyHpInput(inst, m.hp.max, input.value, which)) save();
+    if (commit && applyHpInput(inst, m.hp.max, input.value, which)) save(false);
     render();
   };
   input.addEventListener('keydown', ev => {
@@ -717,10 +805,11 @@ document.addEventListener('click', ev => {
   const grp = () => enc && enc.groups.find(x => x.id === t.dataset.gid);
   switch (act) {
     case 'tab': ui.tab = t.dataset.tab; ui.picker = false; window.scrollTo(0, 0); render(); break;
-    case 'mode': db.settings.mode = t.dataset.mode; save(); render(); break;
-    case 'adv': db.settings.adv = t.dataset.adv; save(); render(); break;
+    case 'mode': db.settings.mode = t.dataset.mode; save(false); render(); break;
+    case 'adv': db.settings.adv = t.dataset.adv; save(false); render(); break;
     case 'toggleLog': ui.logOpen = !ui.logOpen; renderLog(); break;
     case 'searchClear': ui.search.q = ''; ui.search.min = ''; ui.search.max = ''; { const i = $('[data-search=q]'); if (i) i.value = ''; document.querySelectorAll('select[data-search=min],select[data-search=max]').forEach(x => x.value = ''); } refreshResults(); break;
+    case 'libMore': ui.libLimit += 150; refreshResults(); break;
     case 'clearLog': log = []; renderLog(); break;
     // rolls (play mode only)
     case 'rollEntry': if (play) { const { m, e } = findEntry(t); if (e) rollEntry(m, e); } break;
@@ -734,14 +823,14 @@ document.addEventListener('click', ev => {
     case 'hpEdit': openHpEditor(t); break;
     // encounters
     case 'encNew': { const n = prompt('Encounter name:', `Encounter ${db.encounters.length + 1}`); if (n !== null) { newEncounter(n.trim() || undefined); ui.tab = 'encounter'; render(); } break; }
-    case 'encRename': if (enc) { const n = prompt('Rename encounter:', enc.name); if (n) { enc.name = n.trim(); save(); render(); } } break;
-    case 'encDel': if (enc && confirm(`Delete encounter “${enc.name}”? (Stat blocks stay in your Library.)`)) { db.encounters = db.encounters.filter(x => x !== enc); db.activeEnc = null; save(); render(); } break;
+    case 'encRename': if (enc) { const n = prompt('Rename encounter:', enc.name); if (n) { enc.name = n.trim(); save(false); render(); } } break;
+    case 'encDel': if (enc && confirm(`Delete encounter “${enc.name}”? (Stat blocks stay in your Library.)`)) { db.encounters = db.encounters.filter(x => x !== enc); db.activeEnc = null; save(false); render(); } break;
     case 'togglePicker': ui.picker = !ui.picker; render(); break;
     case 'pickMonster': addToEncounter(t.dataset.mid); ui.picker = false; render(); break;
-    case 'resetEnc': if (confirm('Reset every monster in this encounter to full HP and 0 temp HP?')) { enc.groups.forEach(g => { const m = db.library[g.monsterId]; g.instances.forEach(i => { i.hp = m.hp.max; i.temp = 0; }); }); save(); render(); } break;
-    case 'instAdd': { const g = grp(); if (g && addInstance(g, db.library[g.monsterId])) { save(); render(); } break; }
-    case 'instDel': { const g = grp(); if (g) { g.instances = g.instances.filter(i => i.id !== t.dataset.iid); if (!g.instances.length) g.next = 1; save(); render(); } break; }
-    case 'groupDel': { const g = grp(); if (g && confirm(`Remove ${db.library[g.monsterId].name} from this encounter?`)) { enc.groups = enc.groups.filter(x => x !== g); save(); render(); } break; }
+    case 'resetEnc': if (confirm('Reset every monster in this encounter to full HP and 0 temp HP?')) { enc.groups.forEach(g => { const m = db.library[g.monsterId]; g.instances.forEach(i => { i.hp = m.hp.max; i.temp = 0; }); }); save(false); render(); } break;
+    case 'instAdd': { const g = grp(); if (g && addInstance(g, db.library[g.monsterId])) { save(false); render(); } break; }
+    case 'instDel': { const g = grp(); if (g) { g.instances = g.instances.filter(i => i.id !== t.dataset.iid); if (!g.instances.length) g.next = 1; save(false); render(); } break; }
+    case 'groupDel': { const g = grp(); if (g && confirm(`Remove ${db.library[g.monsterId].name} from this encounter?`)) { enc.groups = enc.groups.filter(x => x !== g); save(false); render(); } break; }
     case 'collapse': ui.collapsed[t.dataset.gid] = !ui.collapsed[t.dataset.gid]; render(); break;
     // library
     case 'import': $('#fileInput').click(); break;
@@ -773,18 +862,19 @@ document.addEventListener('click', ev => {
     case 'secMove': { const m = db.library[t.dataset.mid]; const a = m.sections; const i = num(t.dataset.si), j = i + num(t.dataset.dir); if (j >= 0 && j < a.length) { [a[i], a[j]] = [a[j], a[i]]; save(); render(); } break; }
   }
 });
+let searchTimer;
 document.addEventListener('input', ev => {
   const k = ev.target.dataset && ev.target.dataset.search;
-  if (k === 'q') { ui.search.q = ev.target.value; refreshResults(); }
+  if (k === 'q') { ui.search.q = ev.target.value; ui.libLimit = 150; clearTimeout(searchTimer); searchTimer = setTimeout(refreshResults, 90); }
 });
 document.addEventListener('change', ev => {
   const el = ev.target;
-  if (el.dataset.search) { if (el.dataset.search !== 'q') { ui.search[el.dataset.search] = el.value; refreshResults(); } return; }
+  if (el.dataset.search) { if (el.dataset.search !== 'q') { ui.search[el.dataset.search] = el.value; ui.libLimit = 150; refreshResults(); } return; }
   if (el.dataset.path) { onEditChange(el); return; }
-  if (el.dataset.actChange === 'encSelect') { db.activeEnc = el.value; save(); render(); }
+  if (el.dataset.actChange === 'encSelect') { db.activeEnc = el.value; save(false); render(); }
   if (el.dataset.actChange === 'instLabel') {
     const g = activeEnc().groups.find(x => x.id === el.dataset.gid); const i = g && g.instances.find(x => x.id === el.dataset.iid);
-    if (i) { i.label = el.value.trim() || i.label; save(); }
+    if (i) { i.label = el.value.trim() || i.label; save(false); }
   }
 });
 $('#fileInput').addEventListener('change', ev => { const f = [...ev.target.files]; ev.target.value = ''; if (f.length) importFiles(f); });
@@ -806,4 +896,11 @@ window.addEventListener('resize', () => { if (wide() !== lastWide) { lastWide = 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 
-render();
+window.addEventListener('pagehide', flushSave);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSave(); });
+(async function boot() {
+  $('#main').innerHTML = '<div class="empty">Loading your library…</div>';
+  await loadDb();
+  ui.tab = db.encounters.length ? 'encounter' : 'library';
+  render();
+})();
