@@ -9,7 +9,8 @@ const ABIL_NAMES = { str: 'Strength', dex: 'Dexterity', con: 'Constitution', int
 
 /* ============================== state ============================== */
 let db = load();
-let ui = { tab: db.encounters.length ? 'encounter' : 'library', libSel: null, picker: false, logOpen: false, collapsed: {} };
+let ui = { tab: db.encounters.length ? 'encounter' : 'library', libSel: null, picker: false, logOpen: false, collapsed: {},
+  search: { q: '', min: '', max: '', sort: 'name' } };
 let log = [];
 
 function blankDb() {
@@ -135,7 +136,7 @@ function rollDamage(spec, crit) {
   comps.forEach(c => {
     const r = rollExpr(c.dice, crit); if (!r) return;
     total += r.total;
-    lines.push(`${r.html} = <b>${r.total}</b> ${esc(c.type)}`);
+    lines.push(`${/d/.test(r.html) ? r.html + ' = ' : ''}<b>${r.total}</b> ${esc(c.type)}`);
   });
   return { total, lines };
 }
@@ -516,11 +517,10 @@ function render() {
 function wide() { return window.innerWidth >= 900; }
 function viewEncounter() {
   const enc = activeEnc();
-  const lib = Object.values(db.library).sort((a, b) => a.name.localeCompare(b.name));
   const editBanner = db.settings.mode === 'edit' ? `<div class="edit-banner">Edit mode — changes to a stat block apply everywhere it's used. Switch back to Play to roll.</div>` : '';
   if (!enc) return `${editBanner}<div class="panel empty"><p>No encounters yet.</p><button class="btn primary" data-act="encNew">+ New encounter</button></div>`;
   const encOpts = db.encounters.map(e => `<option value="${esc(e.id)}" ${e.id === enc.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('');
-  const picker = ui.picker ? `<div class="picker">${lib.length ? lib.map(m => `<button class="btn" data-act="pickMonster" data-mid="${esc(m.id)}">${esc(m.name)} <span class="muted">CR ${esc(m.cr)}</span></button>`).join('') : '<div class="muted">Library is empty — import stat blocks on the Library tab.</div>'}</div>` : '';
+  const picker = ui.picker ? `<div class="picker">${searchBar()}<div id="pickList">${pickerListHtml()}</div></div>` : '';
   const groups = enc.groups.map(g => {
     const m = db.library[g.monsterId]; if (!m) return '';
     const col = ui.collapsed[g.id];
@@ -562,27 +562,89 @@ function viewEncounter() {
       ${enc.groups.length ? `<button class="btn" data-act="resetEnc">Reset HP</button>` : ''}</div>${picker}</div>
     ${groups || '<div class="empty">This encounter is empty. Tap “+ Add monster”.</div>'}`;
 }
-function viewLibrary() {
-  const lib = Object.values(db.library).sort((a, b) => a.name.localeCompare(b.name));
-  const sel = ui.libSel && db.library[ui.libSel];
-  const list = lib.map(m => `<li class="lib-item ${sel && sel.id === m.id ? 'sel' : ''}">
+
+/* ============================== search ============================== */
+const CR_STEPS = ['0', '1/8', '1/4', '1/2', ...Array.from({ length: 30 }, (_, i) => String(i + 1))];
+function crValue(cr) {
+  const s = String(cr ?? '').trim().replace(/^[A-Za-z]+\s*/, ''); if (s === '') return null; // "M2" (minion) counts as 2
+  const f = s.match(/^(\d+)\s*\/\s*(\d+)$/); if (f) return num(f[1]) / num(f[2], 1);
+  const n = parseFloat(s); return isNaN(n) ? null : n;
+}
+function searchResults() {
+  const { q, min, max, sort } = ui.search;
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const lo = min === '' ? null : crValue(min), hi = max === '' ? null : crValue(max);
+  const list = Object.values(db.library).filter(m => {
+    const hay = `${m.name} ${m.type} ${m.size}`.toLowerCase();
+    if (!words.every(w => hay.includes(w))) return false;
+    const c = crValue(m.cr);
+    if (lo != null && (c == null || c < lo)) return false;
+    if (hi != null && (c == null || c > hi)) return false;
+    return true;
+  });
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  if (sort === 'cr') list.sort((a, b) => ((crValue(a.cr) ?? -1) - (crValue(b.cr) ?? -1)) || byName(a, b));
+  else if (sort === 'crdesc') list.sort((a, b) => ((crValue(b.cr) ?? -1) - (crValue(a.cr) ?? -1)) || byName(a, b));
+  else list.sort(byName);
+  return list;
+}
+function searchBar() {
+  const S = ui.search;
+  const opts = sel => `<option value="">Any</option>` + CR_STEPS.map(c => `<option value="${c}" ${sel === c ? 'selected' : ''}>${c}</option>`).join('');
+  return `<div class="searchbar">
+    <input class="dark grow" type="search" data-search="q" placeholder="Search by name or type…" value="${esc(S.q)}" autocomplete="off" enterkeyhint="search">
+    <div class="row">
+      <label class="muted">CR</label><select class="dark" data-search="min" aria-label="Minimum CR">${opts(S.min)}</select>
+      <span class="muted">to</span><select class="dark" data-search="max" aria-label="Maximum CR">${opts(S.max)}</select>
+      <select class="dark" data-search="sort" aria-label="Sort">
+        <option value="name" ${S.sort === 'name' ? 'selected' : ''}>A–Z</option>
+        <option value="cr" ${S.sort === 'cr' ? 'selected' : ''}>CR low→high</option>
+        <option value="crdesc" ${S.sort === 'crdesc' ? 'selected' : ''}>CR high→low</option>
+      </select>
+      ${S.q || S.min || S.max ? '<button class="link" data-act="searchClear">Clear</button>' : ''}
+    </div></div>`;
+}
+function libListHtml() {
+  const all = Object.keys(db.library).length;
+  if (!all) return '<div class="empty">No stat blocks yet. Import the .json files I made for you.</div>';
+  const lib = searchResults(), sel = ui.libSel;
+  if (!lib.length) return '<div class="empty">No monsters match.</div>';
+  return `<div class="muted count">${lib.length === all ? `${all} stat blocks` : `${lib.length} of ${all}`}</div><ul class="lib-list">${lib.map(m => `<li class="lib-item ${sel === m.id ? 'sel' : ''}">
       <div class="grow"><button class="nm" data-act="libView" data-mid="${esc(m.id)}">${esc(m.name)}</button>
         <div class="sub">CR ${esc(m.cr || '—')} · ${esc([m.size.split(' ')[0], m.type].filter(Boolean).join(' '))} · ${m.edition}</div></div>
       <button class="btn small primary" data-act="libAdd" data-mid="${esc(m.id)}">+ Encounter</button>
       <button class="btn small" data-act="libDup" data-mid="${esc(m.id)}">Duplicate</button>
       <button class="btn small" data-act="libExport" data-mid="${esc(m.id)}">Export</button>
       <button class="btn small danger" data-act="libDel" data-mid="${esc(m.id)}">Delete</button>
-    </li>`).join('');
+    </li>`).join('')}</ul>`;
+}
+function pickerListHtml() {
+  if (!Object.keys(db.library).length) return '<div class="muted">Library is empty — import stat blocks on the Library tab.</div>';
+  const lib = searchResults();
+  return lib.length ? lib.map(m => `<button class="btn" data-act="pickMonster" data-mid="${esc(m.id)}">${esc(m.name)} <span class="muted">CR ${esc(m.cr || '—')}</span></button>`).join('')
+    : '<div class="muted">No monsters match.</div>';
+}
+function refreshResults() {
+  const l = $('#libList'); if (l) l.innerHTML = libListHtml();
+  const p = $('#pickList'); if (p) p.innerHTML = pickerListHtml();
+  const bar = $('.searchbar .row'); // show/hide Clear without re-rendering the input
+  if (bar) { const S = ui.search, has = S.q || S.min || S.max, btn = bar.querySelector('[data-act=searchClear]');
+    if (has && !btn) bar.insertAdjacentHTML('beforeend', '<button class="link" data-act="searchClear">Clear</button>');
+    if (!has && btn) btn.remove(); }
+}
+function viewLibrary() {
+  const sel = ui.libSel && db.library[ui.libSel];
+  const has = Object.keys(db.library).length;
   return `<div class="panel">
       <h2>Library</h2>
       <div class="dropzone">Drag &amp; drop stat block <code>.json</code> files anywhere on this page, or
         <div class="row" style="justify-content:center;margin-top:10px">
           <button class="btn primary" data-act="import">Import files…</button>
           <button class="btn" data-act="newMonster">New blank monster</button>
-          <button class="btn" data-act="exportAll" ${lib.length ? '' : 'disabled'}>Export everything (backup)</button>
+          <button class="btn" data-act="exportAll" ${has ? '' : 'disabled'}>Export everything (backup)</button>
         </div></div>
     </div>
-    <div class="panel">${lib.length ? `<ul class="lib-list">${list}</ul>` : '<div class="empty">No stat blocks yet. Import the .json files I made for you.</div>'}</div>
+    <div class="panel">${has ? searchBar() : ''}<div id="libList">${libListHtml()}</div></div>
     ${sel ? renderStatBlock(sel, { solo: true, wide: wide() }) : ''}`;
 }
 function viewHelp() {
@@ -646,6 +708,7 @@ document.addEventListener('click', ev => {
     case 'mode': db.settings.mode = t.dataset.mode; save(); render(); break;
     case 'adv': db.settings.adv = t.dataset.adv; save(); render(); break;
     case 'toggleLog': ui.logOpen = !ui.logOpen; renderLog(); break;
+    case 'searchClear': ui.search.q = ''; ui.search.min = ''; ui.search.max = ''; { const i = $('[data-search=q]'); if (i) i.value = ''; document.querySelectorAll('select[data-search=min],select[data-search=max]').forEach(x => x.value = ''); } refreshResults(); break;
     case 'clearLog': log = []; renderLog(); break;
     // rolls (play mode only)
     case 'rollEntry': if (play) { const { m, e } = findEntry(t); if (e) rollEntry(m, e); } break;
@@ -698,8 +761,13 @@ document.addEventListener('click', ev => {
     case 'secMove': { const m = db.library[t.dataset.mid]; const a = m.sections; const i = num(t.dataset.si), j = i + num(t.dataset.dir); if (j >= 0 && j < a.length) { [a[i], a[j]] = [a[j], a[i]]; save(); render(); } break; }
   }
 });
+document.addEventListener('input', ev => {
+  const k = ev.target.dataset && ev.target.dataset.search;
+  if (k === 'q') { ui.search.q = ev.target.value; refreshResults(); }
+});
 document.addEventListener('change', ev => {
   const el = ev.target;
+  if (el.dataset.search) { if (el.dataset.search !== 'q') { ui.search[el.dataset.search] = el.value; refreshResults(); } return; }
   if (el.dataset.path) { onEditChange(el); return; }
   if (el.dataset.actChange === 'encSelect') { db.activeEnc = el.value; save(); render(); }
   if (el.dataset.actChange === 'instLabel') {

@@ -1,5 +1,5 @@
 // Offline cache. Bump VERSION whenever you upload new app files.
-const VERSION = 'statblocks-v1';
+const VERSION = 'statblocks-v2';
 const FILES = ['./', './index.html', './app.js', './style.css', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {

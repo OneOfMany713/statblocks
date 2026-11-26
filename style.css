@@ -176,3 +176,9 @@ select.dark, input.dark { background: #362e29; color: var(--chrome-text); border
 .help code { background: #362e29; padding: 1px 5px; border-radius: 4px; }
 .picker { margin-top: 8px; }
 .picker button { display: block; width: 100%; text-align: left; margin: 4px 0; }
+
+/* ---------- search ---------- */
+.searchbar { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.searchbar .row label { font-size: 13px; }
+.searchbar select.dark { padding: 6px 6px; }
+.count { font-size: 13px; margin: 2px 0 4px; }
